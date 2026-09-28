@@ -21,38 +21,70 @@ def reschedule_workouts(schedule, missed_workouts=None, unavailable_days=None):
     updated_schedule = schedule.copy()
     changes = []
 
-    # 1. Remove workouts that were missed.
+    # Keep track of days that became empty because a missed
+    # workout could not be rescheduled.
+    protected_empty_days = set()
+
+    # 1. Reschedule workouts that were missed.
     for day, workout in list(updated_schedule.items()):
         if day in missed_workouts:
             del updated_schedule[day]
-            changes.append(
-                f"{workout} on {day} was missed and needs to be rescheduled."
-            )
+
+            moved = False
+            current_index = DAYS.index(day)
+
+            # First, look for an available day later in the week.
+            candidate_days = DAYS[current_index + 1:]
+
+            # If needed, also consider available days earlier in the week.
+            candidate_days += DAYS[:current_index]
+
+            for new_day in candidate_days:
+                if (
+                    new_day not in updated_schedule
+                    and new_day not in unavailable_days
+                ):
+                    updated_schedule[new_day] = workout
+
+                    changes.append(
+                        f"Moved {workout} from {day} to {new_day} "
+                        "after it was missed."
+                    )
+
+                    moved = True
+                    break
+
+            if not moved:
+                protected_empty_days.add(day)
+
+                changes.append(
+                    f"Could not find an available day to reschedule "
+                    f"{workout} from {day}."
+                )
 
     # 2. Move workouts from unavailable days.
     for day in unavailable_days:
-        if day in updated_schedule:
-            workout = updated_schedule.pop(day)
-
-            moved = False
+        if (
+            day in updated_schedule
+            and day not in protected_empty_days
+        ):
+            workout = updated_schedule[day]
 
             # Look for an available day later in the week.
             for new_day in DAYS[DAYS.index(day) + 1:]:
                 if (
                     new_day not in updated_schedule
                     and new_day not in unavailable_days
+                    and new_day not in protected_empty_days
                 ):
                     updated_schedule[new_day] = workout
+                    del updated_schedule[day]
+
                     changes.append(
                         f"Moved {workout} from {day} to {new_day}."
                     )
-                    moved = True
-                    break
 
-            if not moved:
-                changes.append(
-                    f"Could not find an available day for {workout} from {day}."
-                )
+                    break
 
     # 3. Protect the leg-day rule.
     leg_days = [
@@ -61,21 +93,14 @@ def reschedule_workouts(schedule, missed_workouts=None, unavailable_days=None):
     ]
 
     if len(leg_days) > 1:
-        # Keep the first leg day and move the additional one.
+        # Keep the first leg day and remove extra leg workouts.
         for day in leg_days[1:]:
             workout = updated_schedule.pop(day)
 
-            for new_day in DAYS:
-                if (
-                    new_day not in updated_schedule
-                    and new_day not in unavailable_days
-                ):
-                    updated_schedule[new_day] = workout
-                    changes.append(
-                        f"Moved extra leg workout from {day} to {new_day} "
-                        "to keep one leg-focused workout per week."
-                    )
-                    break
+            changes.append(
+                f"Removed extra leg workout from {day} "
+                "to maintain one leg-focused workout per week."
+            )
 
     # 4. Check for consecutive leg days.
     sorted_days = sorted(
@@ -99,31 +124,35 @@ def reschedule_workouts(schedule, missed_workouts=None, unavailable_days=None):
     return updated_schedule, changes
 
 
-# Example weekly schedule
+# Test Scenario 6: No feasible day
+
 schedule = {
     "Monday": "Upper Body",
-    "Wednesday": "Cardio",
-    "Saturday": "Legs"
+    "Tuesday": "Cardio",
+    "Wednesday": "Legs"
 }
-
-# Example: Saturday becomes unavailable
-unavailable_days = ["Saturday"]
-
-# No workouts were missed in this example
-missed_workouts = []
 
 new_schedule, changes = reschedule_workouts(
     schedule,
-    missed_workouts,
-    unavailable_days
+    missed_workouts=["Wednesday"],
+    unavailable_days=[
+        "Thursday",
+        "Friday",
+        "Saturday",
+        "Sunday",
+        "Monday",
+        "Tuesday"
+    ]
 )
 
-print("ORIGINAL SCHEDULE")
+print("SCENARIO 6: NO FEASIBLE DAY")
+
+print("\nOriginal schedule:")
 print(schedule)
 
-print("\nUPDATED SCHEDULE")
+print("\nUpdated schedule:")
 print(new_schedule)
 
-print("\nDECISIONS AND CHANGES")
+print("\nDecisions and changes:")
 for change in changes:
     print("-", change)
