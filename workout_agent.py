@@ -15,7 +15,13 @@ def _is_rest(workout):
 
 
 def reschedule_workouts(schedule, missed_workouts=None, unavailable_days=None):
-    """Move workouts to empty available days and report unresolved conflicts."""
+    """Apply scheduling rules and report workouts that could not be placed.
+
+    The tool makes deterministic schedule updates. The AI agent interprets the
+    returned results and chooses what to do about any unresolved trade-off.
+
+    Returns (updated_schedule, change_messages).
+    """
     missed_workouts = list(dict.fromkeys(missed_workouts or []))
     unavailable_days = set(unavailable_days or [])
 
@@ -30,13 +36,14 @@ def reschedule_workouts(schedule, missed_workouts=None, unavailable_days=None):
     changes = []
     pending = []
 
-    # Remove all missed workouts first to prevent overwriting sessions.
+    # Remove all missed sessions first, preventing workouts from being
+    # overwritten when multiple sessions must be rescheduled.
     for day in missed_workouts:
         workout = updated.pop(day, None)
         if workout is not None and not _is_rest(workout):
             pending.append((day, workout, "missed"))
 
-    # Remove workouts from unavailable days and queue them for rescheduling.
+    # Remove unavailable-day sessions and queue them for rescheduling.
     for day in DAYS:
         if day in unavailable_days and day in updated:
             workout = updated.pop(day)
@@ -46,7 +53,8 @@ def reschedule_workouts(schedule, missed_workouts=None, unavailable_days=None):
                     f"Removed {workout} from unavailable day {day}."
                 )
 
-    # Keep at most one existing leg-focused workout.
+    # If the input contains multiple leg workouts, preserve the first in
+    # calendar order and report the extra session removed by the tool.
     existing_leg_days = [
         day for day in DAYS
         if day in updated and is_leg_workout(updated[day])
@@ -59,25 +67,29 @@ def reschedule_workouts(schedule, missed_workouts=None, unavailable_days=None):
             "only one leg-focused workout is allowed per week."
         )
 
-    # Try leg-focused sessions first because they have the strictest constraint.
+    # Try leg sessions first because the weekly leg-workout constraint
+    # is more restrictive than the flexible-workout constraint.
     pending.sort(key=lambda item: 0 if is_leg_workout(item[1]) else 1)
 
     for original_day, workout, reason in pending:
+        # Do not add a second leg session alongside an existing one.
+        # Report the unresolved case so the AI can make the trade-off decision.
         if is_leg_workout(workout) and any(
             is_leg_workout(existing) for existing in updated.values()
         ):
             changes.append(
-                f"Dropped {workout} from {original_day}: another "
-                "leg-focused workout is already scheduled this week."
+                f"Could not find an available day to reschedule {workout} "
+                f"from {original_day} ({reason}): another leg workout remains."
             )
             continue
 
+        # Prefer days after the original day, then wrap to earlier days.
         origin_index = DAYS.index(original_day)
-        candidate_days = DAYS[origin_index + 1:] + DAYS[:origin_index]
+        candidates = DAYS[origin_index + 1:] + DAYS[:origin_index]
 
         target_day = next(
             (
-                day for day in candidate_days
+                day for day in candidates
                 if day not in updated and day not in unavailable_days
             ),
             None,
@@ -85,8 +97,8 @@ def reschedule_workouts(schedule, missed_workouts=None, unavailable_days=None):
 
         if target_day is None:
             changes.append(
-                f"Could not find an available day to reschedule "
-                f"{workout} from {original_day} ({reason})."
+                f"Could not find an available day to reschedule {workout} "
+                f"from {original_day} ({reason})."
             )
             continue
 
@@ -96,7 +108,7 @@ def reschedule_workouts(schedule, missed_workouts=None, unavailable_days=None):
             f"after it was {reason}."
         )
 
-    # Validate hard constraints before returning the schedule.
+    # Validate hard constraints before returning the tool result.
     for day in unavailable_days:
         if day in updated and not _is_rest(updated[day]):
             raise RuntimeError(
