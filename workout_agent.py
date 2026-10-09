@@ -1,158 +1,120 @@
 DAYS = [
-    "Monday",
-    "Tuesday",
-    "Wednesday",
-    "Thursday",
-    "Friday",
-    "Saturday",
-    "Sunday"
+    "Monday", "Tuesday", "Wednesday", "Thursday",
+    "Friday", "Saturday", "Sunday",
 ]
 
 
+def is_leg_workout(workout):
+    """Return True for leg-, lower-body-, or glute-focused workouts."""
+    text = str(workout).strip().lower()
+    return "leg" in text or "lower body" in text or "glute" in text
+
+
+def _is_rest(workout):
+    return str(workout).strip().lower() == "rest"
+
+
 def reschedule_workouts(schedule, missed_workouts=None, unavailable_days=None):
-    """
-    Adjust a weekly workout schedule when workouts are missed
-    or days become unavailable.
-    """
+    """Move workouts to empty available days and report unresolved conflicts."""
+    missed_workouts = list(dict.fromkeys(missed_workouts or []))
+    unavailable_days = set(unavailable_days or [])
 
-    missed_workouts = missed_workouts or []
-    unavailable_days = unavailable_days or []
+    invalid_days = (
+        set(schedule) | set(missed_workouts) | unavailable_days
+    ) - set(DAYS)
 
-    updated_schedule = schedule.copy()
+    if invalid_days:
+        raise ValueError(f"Unknown day name(s): {sorted(invalid_days)}")
+
+    updated = dict(schedule)
     changes = []
+    pending = []
 
-    # Keep track of days that became empty because a missed
-    # workout could not be rescheduled.
-    protected_empty_days = set()
+    # Remove all missed workouts first to prevent overwriting sessions.
+    for day in missed_workouts:
+        workout = updated.pop(day, None)
+        if workout is not None and not _is_rest(workout):
+            pending.append((day, workout, "missed"))
 
-    # 1. Reschedule workouts that were missed.
-    for day, workout in list(updated_schedule.items()):
-        if day in missed_workouts:
-            del updated_schedule[day]
-
-            moved = False
-            current_index = DAYS.index(day)
-
-            # First, look for an available day later in the week.
-            candidate_days = DAYS[current_index + 1:]
-
-            # If needed, also consider available days earlier in the week.
-            candidate_days += DAYS[:current_index]
-
-            for new_day in candidate_days:
-                if (
-                    new_day not in updated_schedule
-                    and new_day not in unavailable_days
-                ):
-                    updated_schedule[new_day] = workout
-
-                    changes.append(
-                        f"Moved {workout} from {day} to {new_day} "
-                        "after it was missed."
-                    )
-
-                    moved = True
-                    break
-
-            if not moved:
-                protected_empty_days.add(day)
-
+    # Remove workouts from unavailable days and queue them for rescheduling.
+    for day in DAYS:
+        if day in unavailable_days and day in updated:
+            workout = updated.pop(day)
+            if not _is_rest(workout):
+                pending.append((day, workout, "unavailable"))
                 changes.append(
-                    f"Could not find an available day to reschedule "
-                    f"{workout} from {day}."
+                    f"Removed {workout} from unavailable day {day}."
                 )
 
-    # 2. Move workouts from unavailable days.
-    for day in unavailable_days:
-        if (
-            day in updated_schedule
-            and day not in protected_empty_days
+    # Keep at most one existing leg-focused workout.
+    existing_leg_days = [
+        day for day in DAYS
+        if day in updated and is_leg_workout(updated[day])
+    ]
+
+    for day in existing_leg_days[1:]:
+        workout = updated.pop(day)
+        changes.append(
+            f"Removed extra leg workout from {day} ({workout}); "
+            "only one leg-focused workout is allowed per week."
+        )
+
+    # Try leg-focused sessions first because they have the strictest constraint.
+    pending.sort(key=lambda item: 0 if is_leg_workout(item[1]) else 1)
+
+    for original_day, workout, reason in pending:
+        if is_leg_workout(workout) and any(
+            is_leg_workout(existing) for existing in updated.values()
         ):
-            workout = updated_schedule[day]
-
-            # Look for an available day later in the week.
-            for new_day in DAYS[DAYS.index(day) + 1:]:
-                if (
-                    new_day not in updated_schedule
-                    and new_day not in unavailable_days
-                    and new_day not in protected_empty_days
-                ):
-                    updated_schedule[new_day] = workout
-                    del updated_schedule[day]
-
-                    changes.append(
-                        f"Moved {workout} from {day} to {new_day}."
-                    )
-
-                    break
-
-    # 3. Protect the leg-day rule.
-    leg_days = [
-        day for day, workout in updated_schedule.items()
-        if "leg" in workout.lower()
-    ]
-
-    if len(leg_days) > 1:
-        # Keep the first leg day and remove extra leg workouts.
-        for day in leg_days[1:]:
-            workout = updated_schedule.pop(day)
-
             changes.append(
-                f"Removed extra leg workout from {day} "
-                "to maintain one leg-focused workout per week."
+                f"Dropped {workout} from {original_day}: another "
+                "leg-focused workout is already scheduled this week."
+            )
+            continue
+
+        origin_index = DAYS.index(original_day)
+        candidate_days = DAYS[origin_index + 1:] + DAYS[:origin_index]
+
+        target_day = next(
+            (
+                day for day in candidate_days
+                if day not in updated and day not in unavailable_days
+            ),
+            None,
+        )
+
+        if target_day is None:
+            changes.append(
+                f"Could not find an available day to reschedule "
+                f"{workout} from {original_day} ({reason})."
+            )
+            continue
+
+        updated[target_day] = workout
+        changes.append(
+            f"Moved {workout} from {original_day} to {target_day} "
+            f"after it was {reason}."
+        )
+
+    # Validate hard constraints before returning the schedule.
+    for day in unavailable_days:
+        if day in updated and not _is_rest(updated[day]):
+            raise RuntimeError(
+                f"Scheduling error: {day} is unavailable but has "
+                f"{updated[day]} scheduled."
             )
 
-    # 4. Check for consecutive leg days.
-    sorted_days = sorted(
-        updated_schedule.keys(),
-        key=lambda day: DAYS.index(day)
-    )
-
-    for i in range(len(sorted_days) - 1):
-        day1 = sorted_days[i]
-        day2 = sorted_days[i + 1]
-
-        workout1 = updated_schedule[day1].lower()
-        workout2 = updated_schedule[day2].lower()
-
-        if "leg" in workout1 and "leg" in workout2:
-            changes.append(
-                f"Warning: {day1} and {day2} are consecutive leg days. "
-                "Recovery may need to be adjusted."
-            )
-
-    return updated_schedule, changes
-
-
-# Test Scenario 6: No feasible day
-
-schedule = {
-    "Monday": "Upper Body",
-    "Tuesday": "Cardio",
-    "Wednesday": "Legs"
-}
-
-new_schedule, changes = reschedule_workouts(
-    schedule,
-    missed_workouts=["Wednesday"],
-    unavailable_days=[
-        "Thursday",
-        "Friday",
-        "Saturday",
-        "Sunday",
-        "Monday",
-        "Tuesday"
+    final_leg_days = [
+        day for day in DAYS
+        if day in updated and is_leg_workout(updated[day])
     ]
-)
 
-print("SCENARIO 6: NO FEASIBLE DAY")
+    if len(final_leg_days) > 1:
+        raise RuntimeError(
+            f"Scheduling error: multiple leg workouts remain: {final_leg_days}"
+        )
 
-print("\nOriginal schedule:")
-print(schedule)
+    if not changes:
+        changes.append("No schedule changes were needed.")
 
-print("\nUpdated schedule:")
-print(new_schedule)
-
-print("\nDecisions and changes:")
-for change in changes:
-    print("-", change)
+    return updated, changes

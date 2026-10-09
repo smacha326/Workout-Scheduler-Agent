@@ -1,161 +1,185 @@
 import json
 import os
-from contextlib import redirect_stdout
-from io import StringIO
 
 from google import genai
 from google.genai import types
 
-
-# Import the scheduling tool without showing its sample output.
-with redirect_stdout(StringIO()):
-    from workout_agent import reschedule_workouts
+from workout_agent import DAYS, is_leg_workout, reschedule_workouts
 
 
 MODEL = "gemini-3.5-flash-lite"
 MAX_ITERATIONS = 2
 
-
 CONSTRAINTS = [
     "Schedule no more than one leg-focused workout per week.",
     "Never schedule leg workouts on consecutive days.",
-    "Preserve rest and recovery when possible.",
     "Never schedule a workout on an unavailable day.",
-    "When a workout is missed, reconsider the remaining schedule instead of blindly adding it.",
-    "Keep the workout focus lower-body/glute focused.",
-    "Keep upper-body workouts light or moderate.",
-    "Cardio is flexible.",
+    "Preserve rest and recovery when possible.",
+    "Cardio is flexible and may be sacrificed if necessary.",
 ]
 
 
-def _response_field(value, name):
+def _field(value, name):
     if isinstance(value, dict):
         return value.get(name)
-
     return getattr(value, name, None)
 
 
 def _extract_response_text(response):
-    text = _response_field(response, "output_text")
+    output_text = _field(response, "output_text")
 
-    if isinstance(text, str) and text.strip():
-        return text.strip()
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text.strip()
 
     parts = []
 
-    for step in _response_field(response, "steps") or []:
-        if _response_field(step, "type") != "model_output":
+    for step in _field(response, "steps") or []:
+        if _field(step, "type") != "model_output":
             continue
 
-        for content in _response_field(step, "content") or []:
-            text_part = _response_field(content, "text")
-
-            if isinstance(text_part, str) and text_part.strip():
-                parts.append(text_part.strip())
+        for content in _field(step, "content") or []:
+            part = _field(content, "text")
+            if isinstance(part, str) and part.strip():
+                parts.append(part.strip())
 
     return "\n".join(parts)
 
 
-def _build_effective_schedule(schedule, missed_workouts):
-    """
-    The planned schedule contains workouts that were planned.
-    A workout in missed_workouts was NOT completed.
+def _unresolved_days(tool_result, original_schedule):
+    """Find source days for workouts the Python tool could not place."""
+    if not isinstance(tool_result, dict):
+        return []
 
-    Remove missed workouts from the effective schedule shown
-    to the reasoning model.
-    """
+    failure_lines = [
+        change for change in tool_result.get("changes", [])
+        if isinstance(change, str)
+        and "Could not find an available day" in change
+    ]
 
-    effective_schedule = schedule.copy()
+    return [
+        day for day in DAYS
+        if day in original_schedule
+        and any(f"from {day} (" in line for line in failure_lines)
+    ]
 
-    for day in missed_workouts:
-        effective_schedule.pop(day, None)
 
-    return effective_schedule
+def _is_no_feasible_day(tool_result):
+    if not isinstance(tool_result, dict):
+        return False
+
+    return any(
+        isinstance(change, str)
+        and "Could not find an available day" in change
+        for change in tool_result.get("changes", [])
+    )
 
 
-def _request_decision(
-    client,
-    situation,
-    tool_result=None,
+def _hard_conflict(schedule, pending_missed, unavailable_days):
+    """Check hard constraints independently of Gemini."""
+    if pending_missed:
+        return True
+
+    for day in unavailable_days:
+        if (
+            day in schedule
+            and str(schedule[day]).strip().lower() != "rest"
+        ):
+            return True
+
+    leg_days = [
+        day for day, workout in schedule.items()
+        if is_leg_workout(workout)
+    ]
+
+    return len(leg_days) > 1
+
+
+def _tradeoff_candidates(
+    schedule, unresolved_days, original_schedule, unavailable_days
 ):
-    # Initial decision
+    """Find safe Cardio days when an unresolved leg session needs a slot."""
+    unavailable = set(unavailable_days)
+
+    unresolved_workouts = [
+        original_schedule[day]
+        for day in unresolved_days
+        if day in original_schedule
+    ]
+
+    # This trade-off is for an unresolved leg workout, not another Cardio day.
+    if not any(is_leg_workout(w) for w in unresolved_workouts):
+        return []
+
+    # Never introduce a second leg-focused workout.
+    if any(is_leg_workout(w) for w in schedule.values()):
+        return []
+
+    return [
+        day for day in DAYS
+        if day in schedule
+        and day not in unavailable
+        and "cardio" in str(schedule[day]).lower()
+    ]
+
+
+def _request_decision(client, situation, tool_result=None):
+    """Ask Gemini to choose an action from the current situation."""
     if tool_result is None:
-
-        # Important: when a workout was missed, the model must
-        # use the scheduling tool rather than deciding feasibility itself.
-        missed_workouts = situation.get("missed_workouts", [])
-
-        if missed_workouts:
-            decision_rule = (
-                "A workout is listed in missed_workouts, so that workout "
-                "was NOT completed. You MUST choose action='reschedule' "
-                "so the verified Python scheduling tool can determine "
-                "whether a feasible day exists. Do NOT choose keep for "
-                "a missed workout before the tool checks the schedule."
+        if situation.get("missed_workouts"):
+            rule = (
+                "A workout was missed. Choose action='reschedule' so the "
+                "Python tool can check for an empty available day."
             )
         else:
-            decision_rule = (
-                "Decide whether the schedule needs adjustment based on "
-                "the current situation and constraints."
+            rule = (
+                "Review the schedule. Choose 'reschedule' if a hard "
+                "constraint is violated; otherwise choose 'keep'."
             )
 
         prompt = (
-            "You are the reasoning layer of a workout scheduling agent.\n\n"
-
-            "IMPORTANT STATE RULES:\n"
-            "1. planned_schedule contains workouts that were planned, "
-            "not necessarily completed.\n"
-            "2. A day listed in missed_workouts means that the workout "
-            "planned for that day was NOT completed.\n"
-            "3. A missed workout does NOT count as a completed workout "
-            "toward weekly limits.\n"
-            "4. effective_schedule_for_decision already removes missed "
-            "workouts from the planned schedule.\n"
-            "5. Do not create or rewrite the schedule yourself. "
-            "A separate verified Python tool performs schedule changes.\n\n"
-
-            f"{decision_rule}\n\n"
-
-            "Return ONLY a JSON object with exactly these fields:\n"
-            '{"action":"reschedule" or "keep","reason":"brief explanation"}\n\n'
-
+            "You are the reasoning layer of a workout scheduling agent. "
+            "Do not edit the schedule yourself; Python executes changes.\n"
+            f"{rule}\n"
+            "Return JSON with exactly two fields: action and reason.\n"
             f"Situation: {json.dumps(situation)}"
         )
 
-    # Follow-up decision after a tool call
-    else:
+    elif _is_no_feasible_day(tool_result):
+        candidates = situation.get(
+            "flexible_replacement_candidates", []
+        )
 
         prompt = (
-            "You are the reasoning layer of a workout scheduling agent.\n\n"
+            "The Python scheduling tool could not place a workout on an "
+            "empty available day. Make a trade-off decision.\n"
+            "Hard constraints are non-negotiable: never schedule on an "
+            "unavailable day and never create more than one leg-focused "
+            "workout in the week.\n"
+            f"Safe Cardio replacement days: {json.dumps(candidates)}\n"
+            "Choose 'replace_flexible' only if a safe candidate exists. "
+            "Otherwise choose 'drop'. Do not choose 'keep'. Python will "
+            "validate and execute the decision.\n"
+            "Return JSON with exactly two fields: action and reason.\n"
+            f"Situation: {json.dumps(situation)}\n"
+            f"Previous Python tool result: {json.dumps(tool_result)}"
+        )
 
-            "Review the result returned by the verified scheduling tool "
-            "and decide what should happen next.\n\n"
-
-            "IMPORTANT STATE RULES:\n"
-            "1. A workout listed in missed_workouts was NOT completed.\n"
-            "2. A missed workout does NOT count as a completed workout "
-            "toward weekly limits.\n"
-            "3. The scheduling tool is authoritative about what changes "
-            "are actually possible.\n"
-            "4. If the tool says no available day could be found, "
-            "the task is complete. Choose keep and explain that the "
-            "workout cannot be rescheduled this week.\n"
-            "5. Do not create or rewrite a schedule yourself.\n\n"
-
-            "Return ONLY a JSON object with exactly these fields:\n"
-            '{"action":"reschedule" or "keep","reason":"brief explanation"}\n\n'
-
-            f"Current situation: {json.dumps(situation)}\n"
-            f"Previous tool result: {json.dumps(tool_result)}"
+    else:
+        prompt = (
+            "Review the schedule produced by the Python tool. The tool "
+            "successfully resolved the scheduling conflicts. Choose 'keep' "
+            "and briefly explain why no further change is needed. Do not "
+            "drop a workout that was successfully rescheduled.\n"
+            "Return JSON with exactly two fields: action and reason.\n"
+            f"Situation: {json.dumps(situation)}\n"
+            f"Previous Python tool result: {json.dumps(tool_result)}"
         )
 
     try:
         response = client.interactions.create(
             model=MODEL,
             input=prompt,
-            generation_config={
-                "thinking_level": "minimal"
-            },
+            generation_config={"thinking_level": "minimal"},
             response_format={
                 "type": "text",
                 "mime_type": "application/json",
@@ -164,11 +188,14 @@ def _request_decision(
                     "properties": {
                         "action": {
                             "type": "string",
-                            "enum": ["reschedule", "keep"],
+                            "enum": [
+                                "reschedule",
+                                "keep",
+                                "replace_flexible",
+                                "drop",
+                            ],
                         },
-                        "reason": {
-                            "type": "string",
-                        },
+                        "reason": {"type": "string"},
                     },
                     "required": ["action", "reason"],
                 },
@@ -188,27 +215,23 @@ def _request_decision(
 
     try:
         result = json.loads(response_text)
-
     except (json.JSONDecodeError, TypeError) as error:
         raise ValueError(
             f"Gemini returned invalid JSON: {response_text}"
         ) from error
 
-    if (
-        not isinstance(result, dict)
-        or result.get("action") not in {"reschedule", "keep"}
-    ):
+    allowed = {"reschedule", "keep", "replace_flexible", "drop"}
+
+    if not isinstance(result, dict) or result.get("action") not in allowed:
         raise ValueError(
-            'Gemini JSON must contain action "reschedule" or "keep".'
+            f"Gemini response must use one of: {sorted(allowed)}"
         )
 
     if (
         not isinstance(result.get("reason"), str)
         or not result["reason"].strip()
     ):
-        raise ValueError(
-            "Gemini JSON must contain a non-empty reason."
-        )
+        raise ValueError("Gemini response must include a non-empty reason.")
 
     return {
         "action": result["action"],
@@ -216,188 +239,287 @@ def _request_decision(
     }
 
 
-def _is_no_feasible_day(tool_result):
-    """
-    Detect the scheduler's terminal result:
-    no available day exists for the requested workout.
-    """
+def _apply_flexible_tradeoff(
+    current_schedule,
+    original_schedule,
+    unresolved_days,
+    unavailable_days,
+):
+    """Replace an available Cardio session with a missed leg workout safely."""
+    updated = current_schedule.copy()
+    unavailable = set(unavailable_days)
 
-    if not isinstance(tool_result, dict):
-        return False
-
-    changes = tool_result.get("changes", [])
-
-    if not isinstance(changes, list):
-        return False
-
-    return any(
-        isinstance(change, str)
-        and "Could not find an available day" in change
-        for change in changes
+    missed_leg = next(
+        (
+            original_schedule[day]
+            for day in unresolved_days
+            if day in original_schedule
+            and is_leg_workout(original_schedule[day])
+        ),
+        None,
     )
 
+    if missed_leg is None:
+        return (
+            updated,
+            ["No unresolved leg workout was available for trade-off."],
+            False,
+        )
 
-def workout_agent(
-    schedule,
-    missed_workouts=None,
-    unavailable_days=None,
-):
-    missed_workouts = missed_workouts or []
-    unavailable_days = unavailable_days or []
+    if any(is_leg_workout(workout) for workout in updated.values()):
+        return (
+            updated,
+            ["Trade-off rejected: a leg workout is already scheduled."],
+            False,
+        )
+
+    target_day = next(
+        (
+            day for day in DAYS
+            if day in updated
+            and day not in unavailable
+            and "cardio" in str(updated[day]).lower()
+        ),
+        None,
+    )
+
+    if target_day is None:
+        return updated, ["No safe Cardio replacement was available."], False
+
+    updated[target_day] = missed_leg
+
+    # Validate hard constraints after the change.
+    if (
+        target_day in unavailable
+        or sum(
+            1 for workout in updated.values()
+            if is_leg_workout(workout)
+        ) > 1
+    ):
+        return (
+            current_schedule.copy(),
+            ["Trade-off rejected by constraint validation."],
+            False,
+        )
+
+    changes = [
+        f"Trade-off: replaced Cardio on {target_day} with {missed_leg}; "
+        "the missed leg workout was prioritized over Cardio."
+    ]
+
+    return updated, changes, True
+
+
+def workout_agent(schedule, missed_workouts=None, unavailable_days=None):
+    missed_workouts = list(missed_workouts or [])
+    unavailable_days = list(unavailable_days or [])
 
     api_key = os.environ.get("GEMINI_API_KEY")
 
     if not api_key:
         raise RuntimeError(
-            "GEMINI_API_KEY is not set."
+            "GEMINI_API_KEY is not set. Add it to your environment before running."
         )
 
-    # One API attempt only to avoid repeated delays.
     client = genai.Client(
         api_key=api_key,
         http_options=types.HttpOptions(
             timeout=15000,
-            retry_options=types.HttpRetryOptions(
-                attempts=1
-            ),
+            retry_options=types.HttpRetryOptions(attempts=1),
         ),
     )
 
-    updated_schedule = schedule.copy()
-    pending_missed_workouts = list(missed_workouts)
-
+    original_schedule = dict(schedule)
+    updated_schedule = dict(schedule)
+    pending_missed = list(missed_workouts)
     tool_result = None
-    final_response = None
     changes = []
 
+    final_response = (
+        "Iteration limit reached before a final decision was made."
+    )
+
     for iteration in range(MAX_ITERATIONS):
-
-        effective_schedule = _build_effective_schedule(
-            updated_schedule,
-            pending_missed_workouts,
-        )
-
         situation = {
             "planned_schedule": updated_schedule,
-            "effective_schedule_for_decision": effective_schedule,
-            "missed_workouts": pending_missed_workouts,
+            "missed_workouts": pending_missed if tool_result is None else [],
+            "original_missed_workouts": missed_workouts,
             "unavailable_days": unavailable_days,
             "constraints": CONSTRAINTS,
         }
 
-        result = _request_decision(
-            client,
-            situation,
-            tool_result,
-        )
+        unresolved_days = []
+        candidates = []
 
+        if (
+            tool_result is not None
+            and _is_no_feasible_day(tool_result)
+        ):
+            unresolved_days = _unresolved_days(
+                tool_result, original_schedule
+            )
+
+            candidates = _tradeoff_candidates(
+                updated_schedule,
+                unresolved_days,
+                original_schedule,
+                unavailable_days,
+            )
+
+            situation["unresolved_workout_days"] = unresolved_days
+            situation["flexible_replacement_candidates"] = candidates
+
+        result = _request_decision(client, situation, tool_result)
         action = result["action"]
+        reason = result["reason"]
 
-        print(
-            f"Agent decision (iteration {iteration + 1}): {action}"
-        )
+        # Python independently validates Gemini's proposed action.
+        if tool_result is None:
+            if _hard_conflict(
+                updated_schedule, pending_missed, unavailable_days
+            ):
+                action = "reschedule"
+            elif action not in {"keep", "reschedule"}:
+                action = "keep"
 
-        print(
-            f"Agent reason: {result['reason']}"
-        )
-
-        if action == "keep":
-
-            final_response = result["reason"]
-
-            print("Tool called: no")
-
-            if tool_result is None:
-                print(
-                    "Tool result: not applicable; "
-                    "the agent kept the schedule unchanged."
+        elif _is_no_feasible_day(tool_result):
+            if candidates:
+                # A safe trade-off exists, so do not accept an incorrect
+                # model decision to drop the missed leg workout.
+                action = "replace_flexible"
+                reason = (
+                    f"No empty day is available, but Cardio can safely be "
+                    f"replaced on {', '.join(candidates)}. Replacing one "
+                    "Cardio session with Legs preserves the one-leg-workout "
+                    "limit and avoids unavailable days."
                 )
             else:
-                print(
-                    "Tool result: no additional call; "
-                    "the prior result was retained."
+                action = "drop"
+                reason = (
+                    "No safe empty day or flexible-Cardio replacement is "
+                    "available, so the unresolved workout must be dropped "
+                    "for this week."
                 )
 
+        else:
+            # Never let Gemini undo a successful Python scheduling result.
+            action = "keep"
+
+        print(f"Agent decision (iteration {iteration + 1}): {action}")
+        print(f"Agent reason: {reason}")
+
+        if action == "keep":
+            final_response = reason
+            print("Tool called: no")
             break
 
+        if action == "drop":
+            unresolved_days = (
+                _unresolved_days(tool_result, original_schedule)
+                if tool_result is not None
+                else []
+            )
+
+            prior_successes = [
+                change
+                for change in (tool_result or {}).get("changes", [])
+                if "Could not find an available day" not in change
+            ]
+
+            drop_changes = [
+                f"Dropped {original_schedule[day]} from {day} for this week "
+                "because no safe scheduling option was available."
+                for day in unresolved_days
+                if day in original_schedule
+            ]
+
+            changes = prior_successes + drop_changes
+            final_response = reason
+            print("Agent decision: drop unresolved workout(s) for this week.")
+            break
+
+        if action == "replace_flexible":
+            updated_schedule, tradeoff_changes, success = (
+                _apply_flexible_tradeoff(
+                    updated_schedule,
+                    original_schedule,
+                    unresolved_days,
+                    unavailable_days,
+                )
+            )
+
+            prior_successes = [
+                change
+                for change in (tool_result or {}).get("changes", [])
+                if "Could not find an available day" not in change
+            ]
+
+            # Keep successful earlier changes, but remove stale failure messages.
+            changes = prior_successes + tradeoff_changes
+
+            print("Tool called: apply_flexible_tradeoff")
+            print("Tool result:")
+
+            for change in changes:
+                print(f"- {change}")
+
+            final_response = (
+                reason
+                if success
+                else (
+                    "The trade-off could not be applied safely; the "
+                    "unresolved workout was left off this week's schedule."
+                )
+            )
+            break
+
+        # Execute the deterministic Python scheduling tool.
         print("Tool called: reschedule_workouts")
 
         updated_schedule, changes = reschedule_workouts(
             updated_schedule,
-            missed_workouts=pending_missed_workouts,
+            missed_workouts=pending_missed,
             unavailable_days=unavailable_days,
         )
 
-        # The tool has processed the missed workout request.
-        pending_missed_workouts = []
-
         tool_result = {
-            "updated_schedule": updated_schedule,
-            "changes": changes,
+            "updated_schedule": updated_schedule.copy(),
+            "changes": changes.copy(),
         }
 
         print("Tool result:")
+        for change in changes:
+            print(f"- {change}")
 
-        if changes:
-            for change in changes:
-                print(f"- {change}")
-        else:
-            print("- The scheduler made no changes.")
+        pending_missed = []
 
-        # If the verified tool says no feasible day exists,
-        # stop immediately. Do not waste another Gemini call.
         if _is_no_feasible_day(tool_result):
+            if iteration < MAX_ITERATIONS - 1:
+                # Let Gemini assess the failed attempt and make a trade-off.
+                continue
 
             final_response = (
-                "No feasible day was available to reschedule the "
-                "missed workout, so it must be dropped for this week."
+                "No feasible empty day was found within the iteration limit."
             )
-
-            print("Agent decision: stop")
-
-            print(
-                "Agent reason: The scheduling tool found no feasible day."
-            )
-
-            print(
-                "Tool called: no additional call; "
-                "the tool result is a terminal condition."
-            )
-
             break
 
-        # Do not make an unnecessary third call.
-        if iteration == MAX_ITERATIONS - 1:
+        if iteration < MAX_ITERATIONS - 1:
+            # Feed the successful result back to Gemini for review.
+            continue
 
-            final_response = (
-                "The iteration limit was reached after the latest "
-                "scheduling adjustment."
-            )
+        final_response = (
+            "The Python tool updated the schedule; "
+            "the iteration limit was reached."
+        )
 
-            print("Agent decision: stop")
-
-            print(
-                "Agent reason: The maximum number of iterations was reached."
-            )
-
-            print(
-                "Tool called: no additional call; "
-                "the iteration limit was reached."
-            )
-
-            break
-
-    print(
-        f"Final agent response: {final_response}"
-    )
-
+    print(f"Final agent response: {final_response}")
     print("Final updated schedule:")
 
-    for day, workout in updated_schedule.items():
-        print(f"{day}: {workout}")
+    for day in DAYS:
+        if day in updated_schedule:
+            print(f"{day}: {updated_schedule[day]}")
 
     return updated_schedule, changes
-
 
 
 if __name__ == "__main__":
@@ -455,7 +577,7 @@ if __name__ == "__main__":
             "unavailable": [],
         },
         {
-            "name": "TEST 5: No Feasible Day",
+            "name": "TEST 5: No Feasible Day / Trade-off",
             "schedule": {
                 "Monday": "Upper Body",
                 "Tuesday": "Cardio",
@@ -473,9 +595,11 @@ if __name__ == "__main__":
         print("\n" + "=" * 55)
         print(test["name"])
         print("=" * 55)
+
         print("Input schedule:")
         for day, workout in test["schedule"].items():
             print(f"  {day}: {workout}")
+
         print(f"Missed workouts: {test['missed']}")
         print(f"Unavailable days: {test['unavailable']}")
 
