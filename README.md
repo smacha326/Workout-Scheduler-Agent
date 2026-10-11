@@ -76,7 +76,7 @@ The scenarios help verify scheduling behavior, hard-constraint validation, and t
 
 ## Limitations and Future Improvements
 
-The agent currently uses predefined example schedules and a limited set of workout constraints. Its scheduling tool uses deterministic placement rules, and the model's decisions are limited by the available actions and the iteration cap. Future improvements could include interactive schedule input, more complex recovery preferences, additional test scenarios, and more detailed evaluation of trade-offs.
+The agent currently uses a limited set of workout constraints. Its scheduling tool uses deterministic placement rules, and the model's decisions are limited by the available actions and the iteration cap. Future improvements could include interactive schedule input, more complex recovery preferences, additional test scenarios, and more detailed evaluation of trade-offs.
 
 ## Privacy and Security
 
